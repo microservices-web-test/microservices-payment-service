@@ -27,9 +27,32 @@ services:
     depends_on:
       payment-db:
         condition: service_healthy
+      # Do not start the app until schema migrations have been applied.
+      migrate:
+        condition: service_completed_successfully
     networks:
       - microservices-net
     restart: unless-stopped
+
+  # One-shot migration job: applies any pending SQL migrations in ./db/migrations
+  # to payment-db, records them in flyway_schema_history, then exits (Exited 0).
+  # It is NOT a long-running service; "Exited (0)" means success.
+  migrate:
+    image: flyway/flyway:10-alpine
+    container_name: payment-migrate
+    command: -connectRetries=20 -baselineOnMigrate=true migrate
+    environment:
+      FLYWAY_URL: jdbc:postgresql://payment-db:5432/paymentdb
+      FLYWAY_USER: payment
+      FLYWAY_PASSWORD: paymentpass
+    volumes:
+      - ./db/migrations:/flyway/sql:ro
+    depends_on:
+      payment-db:
+        condition: service_healthy
+    networks:
+      - microservices-net
+    restart: "no"
 
   payment-db:
     image: postgres:16-alpine
@@ -40,7 +63,10 @@ services:
       POSTGRES_DB: paymentdb
     volumes:
       - payment-db-data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # NOTE: schema/seed is now owned by the Flyway "migrate" service, not by
+      # Postgres' docker-entrypoint-initdb.d. The old ./db/init.sql file is kept
+      # in the repo for reference but is intentionally no longer mounted here,
+      # otherwise it would double-run the seed on first boot.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U payment -d paymentdb"]
       interval: 5s
