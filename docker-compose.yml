@@ -57,6 +57,8 @@ services:
   payment-db:
     image: postgres:16-alpine
     container_name: payment-db
+    ports:
+      - "5456:5432"
     environment:
       POSTGRES_USER: payment
       POSTGRES_PASSWORD: paymentpass
