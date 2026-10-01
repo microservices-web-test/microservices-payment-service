@@ -1,0 +1,58 @@
+# This service is an independent repo. It joins the shared, pre-created
+# "microservices-net" network so the frontend (in a different repo/compose
+# project) can reach it by container name.
+#
+# One-time, before the first `up`:
+#   docker network create microservices-net
+#
+# Then from this folder:
+#   docker-compose up -d --build
+
+services:
+  payment-service:
+    build: .
+    image: payment-service:local
+    container_name: payment-service
+    environment:
+      PORT: "5000"
+      DB_HOST: payment-db
+      DB_PORT: "5432"
+      DB_USER: payment
+      DB_PASSWORD: paymentpass
+      DB_NAME: paymentdb
+    ports:
+      # Optional: host-exposed for direct debugging only. The frontend talks
+      # over the shared network, not through this published port.
+      - "5000:5000"
+    depends_on:
+      payment-db:
+        condition: service_healthy
+    networks:
+      - microservices-net
+    restart: unless-stopped
+
+  payment-db:
+    image: postgres:16-alpine
+    container_name: payment-db
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: paymentpass
+      POSTGRES_DB: paymentdb
+    volumes:
+      - payment-db-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d paymentdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - microservices-net
+    restart: unless-stopped
+
+volumes:
+  payment-db-data:
+
+networks:
+  microservices-net:
+    external: true
