@@ -1,0 +1,205 @@
+name: CI
+
+# CI gate checks. Pushes to master and PRs targeting master.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # 1) Install, lint, byte-compile and unit tests.
+  quality:
+    name: Lint / Compile / Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies (runtime + dev tooling)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff)
+        run: ruff format --check .
+
+      # Python has no compile/bundle step; byte-compiling is the equivalent
+      # "does it build" gate and catches syntax errors before the image build.
+      - name: Build check (byte-compile sources)
+        run: python -m compileall -q app.py tests
+
+      - name: Unit tests (pytest)
+        run: pytest -q --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+          retention-days: 7
+
+  # 2) Dependency vulnerability audit.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit==2.7.3
+
+      # Gate: fail on advisories in RUNTIME dependencies, since those are the
+      # packages that actually ship inside the container image.
+      - name: pip-audit (runtime deps)
+        run: pip-audit --requirement requirements.txt --strict
+
+      # Informational: dev/CI-only tooling advisories never reach production,
+      # so surface them without blocking the build. Review these periodically.
+      - name: pip-audit (dev tooling, report only)
+        run: pip-audit --requirement requirements-dev.txt || true
+
+  # 3) Verify the container image builds, scan it for CVEs, and smoke-test it.
+  docker:
+    name: Docker build + image scan
+    runs-on: ubuntu-latest
+    needs: [quality]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: payment-service:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The container must actually boot and serve traffic. /health is
+      # DB-independent, so this needs no PostgreSQL instance.
+      - name: Smoke test the image
+        run: |
+          docker run -d --name payment-ci -p 5000:5000 \
+            payment-service:ci-${{ github.sha }}
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:5000/health; then
+              echo "::notice::health check passed"
+              docker rm -f payment-ci
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "health check never passed; container logs:"
+          docker logs payment-ci
+          docker rm -f payment-ci
+          exit 1
+
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.24.0
+        with:
+          image-ref: payment-service:ci-${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
+  # 4) Validate that Flyway migrations apply cleanly against a fresh database.
+  migrations:
+    name: Flyway migration check
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: paymentpass
+          POSTGRES_DB: paymentdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payment -d paymentdb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply migrations with Flyway
+        run: |
+          docker run --rm --network host \
+            -v "${GITHUB_WORKSPACE}/db/migrations:/flyway/sql:ro" \
+            flyway/flyway:10-alpine \
+            -url=jdbc:postgresql://localhost:5432/paymentdb \
+            -user=payment \
+            -password=paymentpass \
+            -connectRetries=20 \
+            -baselineOnMigrate=true \
+            migrate
+
+      - name: Verify expected schema exists
+        run: |
+          docker run --rm --network host -e PGPASSWORD=paymentpass \
+            postgres:16-alpine \
+            psql -h localhost -U payment -d paymentdb \
+              -c "SELECT count(*) FROM transactions;"
+
+  # 5) Secret scanning on the repo history / diff.
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Use the open-source gitleaks CLI directly. The gitleaks GitHub Action
+      # requires a paid GITLEAKS_LICENSE for org-owned repos; the CLI (MIT) does
+      # not. Scans full git history and fails the job on any finding.
+      - name: Gitleaks (open-source CLI, no license required)
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}:/repo" \
+            ghcr.io/gitleaks/gitleaks:latest \
+            detect --source=/repo --redact --verbose --exit-code=1

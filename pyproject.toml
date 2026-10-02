@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests import the top-level app module directly.
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = ["db"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

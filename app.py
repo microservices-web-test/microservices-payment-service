@@ -4,6 +4,7 @@
 # talks to its OWN dedicated PostgreSQL database (payment-db).
 
 import os
+
 import psycopg2
 from flask import Flask, jsonify
 
