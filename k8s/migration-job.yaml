@@ -1,7 +1,3 @@
-# One-shot Flyway Job: applies the SQL migrations in db/migrations to payment-db,
-# records them in flyway_schema_history, then exits. SQL is supplied by the
-# "payment-migrations" ConfigMap, which the Jenkins pipeline (re)creates from the
-# repo's db/migrations folder on every deploy. Flyway is idempotent.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -22,9 +18,6 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: flyway
-          # NOTE: use the non-alpine tag. flyway/flyway:10-alpine is amd64-only
-          # (no arm64 in its manifest) and fails with "exec format error" on our
-          # arm64 nodes. flyway/flyway:10 is multi-arch and includes linux/arm64.
           image: flyway/flyway:10
           args:
             - "-connectRetries=30"
