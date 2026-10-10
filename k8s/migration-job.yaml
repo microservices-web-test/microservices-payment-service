@@ -1,0 +1,50 @@
+# One-shot Flyway Job: applies the SQL migrations in db/migrations to payment-db,
+# records them in flyway_schema_history, then exits. SQL is supplied by the
+# "payment-migrations" ConfigMap, which the Jenkins pipeline (re)creates from the
+# repo's db/migrations folder on every deploy. Flyway is idempotent.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: payment-migrate
+  namespace: microservices
+  labels:
+    app: payment-migrate
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: payment-migrate
+        app.kubernetes.io/part-of: microservices-demo
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: flyway
+          image: flyway/flyway:10-alpine
+          args:
+            - "-connectRetries=30"
+            - "-baselineOnMigrate=true"
+            - "migrate"
+          env:
+            - name: FLYWAY_URL
+              value: jdbc:postgresql://payment-db:5432/paymentdb
+            - name: FLYWAY_USER
+              valueFrom:
+                secretKeyRef:
+                  name: payment-db-credentials
+                  key: POSTGRES_USER
+            - name: FLYWAY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: payment-db-credentials
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: sql
+              mountPath: /flyway/sql
+              readOnly: true
+      volumes:
+        - name: sql
+          configMap:
+            name: payment-migrations

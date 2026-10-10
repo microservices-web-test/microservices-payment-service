@@ -1,0 +1,90 @@
+# Dedicated PostgreSQL for the payment service (database-per-service pattern).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: payment-db-data
+  namespace: microservices
+  labels:
+    app: payment-db
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName omitted -> uses k3s default (local-path).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-db
+  namespace: microservices
+  labels:
+    app: payment-db
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: payment-db
+  template:
+    metadata:
+      labels:
+        app: payment-db
+        app.kubernetes.io/part-of: microservices-demo
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: payment-db-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: payment-db-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-db
+  namespace: microservices
+  labels:
+    app: payment-db
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: payment-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

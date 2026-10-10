@@ -1,0 +1,20 @@
+# Internal (ClusterIP) Service. The frontend's nginx BFF reaches it at
+# http://payment-service.microservices.svc.cluster.local:5000 — so the name and
+# port here MUST stay "payment-service" / 5000.
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: microservices
+  labels:
+    app: payment-service
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: payment-service
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http
