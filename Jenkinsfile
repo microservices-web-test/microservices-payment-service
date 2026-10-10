@@ -76,7 +76,76 @@ pipeline {
         }
       }
     }
-    stage('Deploy to k3s') {
+    // ---------------------------------------------------------------------
+    // The in-cluster work is split into three visible stages so the Jenkins
+    // stage view tells a clear story: bring the DB up -> migrate it -> deploy
+    // the app. Each stage needs the kubeconfig (Postgres, Flyway and the app
+    // all live inside k3s).
+    // ---------------------------------------------------------------------
+    stage('Provision Postgres (k3s)') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            set -eu
+            export KUBECONFIG="${KUBECONFIG_FILE}"
+            # Namespace (shared; harmless if it already exists).
+            kubectl apply -f k8s/namespace.yaml
+            # DB credentials + the dedicated Postgres (PVC / Deployment / Service).
+            kubectl apply -f k8s/secret.yaml
+            kubectl apply -f k8s/postgres.yaml
+            # Block until the database is actually accepting connections.
+            echo ">> waiting for payment-db to become Ready..."
+            kubectl -n "${K8S_NAMESPACE}" rollout status deployment/payment-db --timeout=180s
+          '''
+        }
+      }
+    }
+    stage('DB migration (Flyway)') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            set -eu
+            export KUBECONFIG="${KUBECONFIG_FILE}"
+
+            # Ship the repo's SQL to the cluster as a ConfigMap (the Flyway Job
+            # mounts it at /flyway/sql).
+            kubectl -n "${K8S_NAMESPACE}" create configmap payment-migrations \
+              --from-file=db/migrations/ \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            # A Job's pod template is immutable, so delete any previous run first,
+            # then (re)create it. Flyway is idempotent -> safe to run every build.
+            kubectl -n "${K8S_NAMESPACE}" delete job payment-migrate --ignore-not-found
+            kubectl apply -f k8s/migration-job.yaml
+
+            # Stream the Flyway container's output straight into this console so
+            # you can watch it: connect -> check schema history -> apply pending
+            # migrations -> exit. First wait for the Job's pod to appear.
+            echo ">> waiting for the payment-migrate pod to start..."
+            POD=""
+            for i in $(seq 1 60); do
+              POD=$(kubectl -n "${K8S_NAMESPACE}" get pods -l job-name=payment-migrate \
+                      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              [ -n "$POD" ] && break
+              sleep 2
+            done
+            echo ">> streaming Flyway logs from pod: ${POD}"
+            kubectl -n "${K8S_NAMESPACE}" logs -f "job/payment-migrate" || true
+
+            # Assert the Job actually succeeded; dump diagnostics and fail if not.
+            if ! kubectl -n "${K8S_NAMESPACE}" wait --for=condition=complete \
+                 job/payment-migrate --timeout=180s; then
+              echo "!! Flyway migration did NOT complete successfully:"
+              kubectl -n "${K8S_NAMESPACE}" logs "job/payment-migrate" --tail=-1 || true
+              kubectl -n "${K8S_NAMESPACE}" describe job payment-migrate || true
+              exit 1
+            fi
+            echo ">> migrations applied successfully."
+          '''
+        }
+      }
+    }
+    stage('Deploy app (k3s)') {
       steps {
         withCredentials([
           file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE'),
@@ -86,34 +155,22 @@ pipeline {
           sh '''
             set -eu
             export KUBECONFIG="${KUBECONFIG_FILE}"
-            # 1. Namespace (shared; harmless if it exists).
-            kubectl apply -f k8s/namespace.yaml
-            # 2. Private-registry pull secret (idempotent create-or-update).
+            # Private-registry pull secret (idempotent create-or-update) — the
+            # app image is private, so the cluster needs credentials to pull it.
             kubectl -n "${K8S_NAMESPACE}" create secret docker-registry "${PULL_SECRET}" \
               --docker-server="${OCIR_REGISTRY}" \
               --docker-username="${OCIR_USER}" \
               --docker-password="${OCIR_TOKEN}" \
               --dry-run=client -o yaml | kubectl apply -f -
-            # 3. DB credentials + dedicated Postgres.
-            kubectl apply -f k8s/secret.yaml
-            kubectl apply -f k8s/postgres.yaml
-            kubectl -n "${K8S_NAMESPACE}" rollout status deployment/payment-db --timeout=180s
-            # 4. DB migrations via a one-shot Flyway Job.
-            kubectl -n "${K8S_NAMESPACE}" create configmap payment-migrations \
-              --from-file=db/migrations/ \
-              --dry-run=client -o yaml | kubectl apply -f -
-            kubectl -n "${K8S_NAMESPACE}" delete job payment-migrate --ignore-not-found
-            kubectl apply -f k8s/migration-job.yaml
-            kubectl -n "${K8S_NAMESPACE}" wait --for=condition=complete job/payment-migrate --timeout=180s
-            # 5. Internal Service (ClusterIP payment-service:5000).
+            # Internal Service (ClusterIP payment-service:5000).
             kubectl apply -f k8s/service.yaml
-            # 6. App Deployment with the freshly built, immutable tag.
+            # App Deployment with the freshly built, immutable tag.
             sed "s#${IMAGE_NAME}:v1#${IMAGE_NAME}:${IMAGE_TAG}#g" k8s/deployment.yaml \
               | kubectl apply -f -
             kubectl -n "${K8S_NAMESPACE}" set image \
               "deployment/${K8S_DEPLOYMENT}" \
               "${K8S_CONTAINER}=${IMAGE_NAME}:${IMAGE_TAG}"
-            # 7. Wait for rollout; auto-rollback on failure.
+            # Wait for rollout; auto-rollback on failure.
             if ! kubectl -n "${K8S_NAMESPACE}" rollout status \
                  "deployment/${K8S_DEPLOYMENT}" --timeout=180s; then
               echo "Rollout failed; rolling back."
