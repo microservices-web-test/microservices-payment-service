@@ -22,7 +22,10 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: flyway
-          image: flyway/flyway:10-alpine
+          # NOTE: use the non-alpine tag. flyway/flyway:10-alpine is amd64-only
+          # (no arm64 in its manifest) and fails with "exec format error" on our
+          # arm64 nodes. flyway/flyway:10 is multi-arch and includes linux/arm64.
+          image: flyway/flyway:10
           args:
             - "-connectRetries=30"
             - "-baselineOnMigrate=true"
